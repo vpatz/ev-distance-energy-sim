@@ -21,7 +21,7 @@ Simulate battery power dissipation for electric vehicles to generate synthetic d
 | distance_km | Distance traveled in the time window (km) |
 | remaining_range_km | Estimated remaining range based on current SOC and energy consumption rate (km) | 
 
-## Application for training distance prediction models
-- Evaluating federated learning of Range Prediction Models
+## Applications
+- Federated learning of Range Prediction Models
 - Validating physical constants for energy efficiency
 - Can be modified for other physical processes that involve energy transformations 
