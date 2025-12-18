@@ -54,15 +54,15 @@ import torch
 class VehicleParams:
     """EV vehicle parameters for energy calculation"""
     mass: float = 1500.0                # Vehicle mass (kg)
-    battery_capacity: float = 100.0     # Battery capacity (kWh)
+    battery_capacity: float = 150.0     # Battery capacity (kWh)
     #frontal_area: float = 2.5          # Frontal area (m^2)
     #drag_coeff: float = 0.28           # Aerodynamic drag coefficient
     #rolling_resistance: float = 0.012  # Rolling resistance coefficient
-    u_roll: float = 0.012               # Rolling resistance coefficient
+    u_roll: float = 0.002               # Rolling resistance coefficient
     #K_m: float = 0.75                  # Motor efficiency (battery to kinetic)
-    K_regen: float = 0.1                # Ratio of translation motion energy that is regenerated
-    P_aux: float = 0.5                  # Auxiliary systems power consumption (kW)
-    P_heat: float = 0.1                 # Battery thermal loss (kW)
+    K_regen: float = 0.2                # Ratio of translation motion energy that is regenerated
+    P_aux: float = 0.05                  # Auxiliary systems power consumption (kW)
+    P_heat: float = 0.01                 # Battery thermal loss (kW)
 
 
 
@@ -151,8 +151,10 @@ def calculate_energy_loss_in_time_window(
 
     E_regen = vehicle.K_regen *  E_motion
 
+    E_total_loss = E_motion + E_grav + E_heat + E_aux - E_regen
+
        
-    return E_motion + E_grav + E_heat + E_aux - E_regen
+    return E_total_loss, E_motion, E_grav, E_heat, E_aux, E_regen
 
 
 '''def calculate_power_consumption(
@@ -201,10 +203,11 @@ def calculate_energy_loss_in_time_window(
 # =============================================================================
 
 def generate_scenario_data(
-    drive_duration_sec: int = 360000,
-    window_size_sec: int = 30,
-    speed_kmph: float = 80.0,
-    initial_soc_percent: float = 90.0,
+    drive_duration_sec: int = 36000,
+    window_size_sec: int = 15,
+    speed_kmph: float = 40.0,
+    initial_soc_percent: float = 95.0,
+    grade: Optional[float] = 0,
     vehicle: Optional[VehicleParams] = None,
     env: Optional[EnvironmentParams] = None
 ) -> pd.DataFrame:
@@ -229,7 +232,7 @@ def generate_scenario_data(
     timeWindow.time = window_size_sec
 
     
-    velocity = speed_kmph / 3.6  # Convert to m/s
+    #velocity = speed_kmph / 3.6  # Convert to m/s
     time_steps = int(drive_duration_sec / window_size_sec)
     
     # Initialize arrays
@@ -239,15 +242,16 @@ def generate_scenario_data(
         'window_duration_sec': np.full(time_steps, window_size_sec),
         'avg_speed_kmh': np.full(time_steps, speed_kmph),
     #    'acceleration': np.zeros(time_steps),
-        'grade': np.zeros(time_steps),
+        #'grade': np.zeros(time_steps),
+        'grade': np.full(time_steps, grade),
         'vehicle_mass': np.full(time_steps, vehicle.mass),
-        'battery_enery_drain_kwh': np.zeros(time_steps),
-        'motion_engery_drain_kwh': np.zeros(time_steps),
-        'gravity_engery_drain_kwh': np.zeros(time_steps),
+        'battery_energy_spend_kwh': np.zeros(time_steps),
+        'motion_energy_drain_kwh': np.zeros(time_steps),
+        'gravity_energy_drain_kwh': np.zeros(time_steps),
         'heat_energy_drain_kwh': np.zeros(time_steps),
         'aux_energy_drain_kwh': np.zeros(time_steps),
-        'regen_engery_gain_kwh': np.zeros(time_steps),
-        'soc': np.zeros(time_steps),
+        'regen_energy_gain_kwh': np.zeros(time_steps),
+        'soc_percent': np.zeros(time_steps),
         #'battery_temp': np.zeros(time_steps),
         'distance_km': np.zeros(time_steps),
         #'energy_consumed_kwh': np.zeros(time_steps),
@@ -256,56 +260,55 @@ def generate_scenario_data(
     }
     
     # Initial conditions
-    current_soc = initial_soc_percent
+    current_soc_percent = initial_soc_percent
     #battery_temp = env.ambient_temp + 5.0  # Battery slightly warmer than ambient
-    total_distance = 0.0
+    total_distance_km = 0.0 
     #total_energy = 0.0
     
     for i in range(time_steps):
 
-        if current_soc < 2:
+        if current_soc_percent <= 1: # stop when soc is < 1%
             break
 
 
-        # Calculate power consumption
-        #battery_power, regen_power = calculate_power_consumption(
-        #    velocity, 0.0, 0.0, vehicle, env
-        step_energy_loss = calculate_energy_loss_in_time_window(
+        # Calculate energy spent from battery in time window
+        step_energy_spend, motion_energy_drain, gravity_energy_drain, heat_energy_drain, aux_energy_drain, regen_energy_gain  = calculate_energy_loss_in_time_window(
             vehicle, env, timeWindow
-
         )
-        
-        # Calculate heat loss
-        #heat_loss = calculate_heat_loss(battery_power, battery_temp, env.ambient_temp, vehicle)
         
         # Update energy and SOC
         #energy_step = (battery_power + heat_loss) * dt / 3600  # kWh
         #total_energy += energy_step
-        current_soc -= (step_energy_loss / vehicle.battery_capacity) * 100
+        current_soc_percent -= (step_energy_spend / vehicle.battery_capacity) * 100
         
         # Update distance
-        distance_step = velocity * dt / 1000  # km
-        total_distance += distance_step
+        distance_step_km = speed_kmph * (window_size_sec /3600.0) 
+        total_distance_km += distance_step_km
         
         # Update battery temperature (simplified)
-        battery_temp += (battery_power * 0.01 - 0.05 * (battery_temp - env.ambient_temp)) * dt / 60
+        #battery_temp += (battery_power * 0.01 - 0.05 * (battery_temp - env.ambient_temp)) * dt / 60
         
         # Calculate remaining range
-        if battery_power > 0:
-            energy_rate = battery_power / velocity * 1000  # kWh/km
-            remaining_energy = (current_soc / 100) * vehicle.battery_capacity
-            remaining_range = remaining_energy / energy_rate if energy_rate > 0 else 0
+        if current_soc_percent > 0:
+            energy_spend_per_km = step_energy_spend / distance_step_km   # kWh/km
+            remaining_energy = (current_soc_percent / 100) * vehicle.battery_capacity
+            remaining_range_km = remaining_energy / energy_spend_per_km
+            #if energy_rate > 0 else 0
         else:
-            remaining_range = 0
+            remaining_range_km = 0
         
         # Store data
-        data['battery_power_kw'][i] = battery_power
-        data['regen_power_kw'][i] = regen_power
-        data['soc'][i] = max(0, current_soc)
-        data['battery_temp'][i] = battery_temp
-        data['distance_km'][i] = total_distance
-        data['energy_consumed_kwh'][i] = total_energy
-        data['remaining_range_km'][i] = max(0, remaining_range)
+        data['battery_energy_spend_kwh'][i] = step_energy_spend
+        data['motion_energy_drain_kwh'][i] = motion_energy_drain
+        data['gravity_energy_drain_kwh'][i] = gravity_energy_drain
+        data['heat_energy_drain_kwh'][i] = heat_energy_drain
+        data['aux_energy_drain_kwh'][i] = aux_energy_drain
+        data['regen_energy_gain_kwh'][i] = regen_energy_gain
+        data['soc_percent'][i] = current_soc_percent
+        #data['battery_temp'][i] = battery_temp
+        data['distance_km'][i] = distance_step_km
+        #data['energy_consumed_kwh'][i] = total_energy
+        data['remaining_range_km'][i] = remaining_range_km
     
     return pd.DataFrame(data)
 
@@ -842,9 +845,9 @@ def main():
     print("\n[Scenario 1] Level road, constant speed (80 km/h)...")
     df1 = generate_scenario_data(drive_duration_sec, window_size_sec, speed_kmph, initial_soc_percent)
     #print(f"  Duration: 600 minutes")
-    print(f"  Final SOC: {df1['soc'].iloc[-1]:.1f}%")
+    print(f"  Final SOC: {df1['soc_percent'].iloc[-1]:.1f}%")
     print(f"  Distance traveled: {df1['distance_km'].iloc[-1]:.1f} km")
-    print(f"  Energy consumed: {df1['energy_consumed_kwh'].iloc[-1]:.2f} kWh")
+    #print(f"  Energy consumed: {df1['energy_consumed_kwh'].iloc[-1]:.2f} kWh")
     save_scenario_to_csv(df1, "scenario_1_level_constant_speed")
 
 
