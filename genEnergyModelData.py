@@ -241,10 +241,9 @@ def generate_scenario_data(
         'time_stamp_sec': time_sec,
         'window_duration_sec': np.full(time_steps, window_size_sec),
         'avg_speed_kmh': np.full(time_steps, speed_kmph),
-    #    'acceleration': np.zeros(time_steps),
-        #'grade': np.zeros(time_steps),
         'grade': np.full(time_steps, grade),
         'vehicle_mass': np.full(time_steps, vehicle.mass),
+        'battery_capacity_kwh': np.full(time_steps, vehicle.battery_capacity),
         'battery_energy_spend_kwh': np.zeros(time_steps),
         'motion_energy_drain_kwh': np.zeros(time_steps),
         'gravity_energy_drain_kwh': np.zeros(time_steps),
@@ -252,23 +251,22 @@ def generate_scenario_data(
         'aux_energy_drain_kwh': np.zeros(time_steps),
         'regen_energy_gain_kwh': np.zeros(time_steps),
         'soc_percent': np.zeros(time_steps),
-        #'battery_temp': np.zeros(time_steps),
         'distance_km': np.zeros(time_steps),
-        #'energy_consumed_kwh': np.zeros(time_steps),
-        
+        'remaining_energy_kwh': np.zeros(time_steps),
         'remaining_range_km': np.zeros(time_steps),
     }
     
     # Initial conditions
     current_soc_percent = initial_soc_percent
-    #battery_temp = env.ambient_temp + 5.0  # Battery slightly warmer than ambient
     total_distance_km = 0.0 
-    #total_energy = 0.0
+    actual_steps = 0  # Track actual number of steps completed
     
     for i in range(time_steps):
 
         if current_soc_percent <= 1: # stop when soc is < 1%
             break
+        
+        actual_steps += 1
 
 
         # Calculate energy spent from battery in time window
@@ -288,12 +286,11 @@ def generate_scenario_data(
         # Update battery temperature (simplified)
         #battery_temp += (battery_power * 0.01 - 0.05 * (battery_temp - env.ambient_temp)) * dt / 60
         
-        # Calculate remaining range
-        if current_soc_percent > 0:
+        # Calculate remaining energy and range
+        remaining_energy = max(0, (current_soc_percent / 100) * vehicle.battery_capacity)
+        if current_soc_percent > 0 and step_energy_spend > 0:
             energy_spend_per_km = step_energy_spend / distance_step_km   # kWh/km
-            remaining_energy = (current_soc_percent / 100) * vehicle.battery_capacity
             remaining_range_km = remaining_energy / energy_spend_per_km
-            #if energy_rate > 0 else 0
         else:
             remaining_range_km = 0
         
@@ -305,10 +302,13 @@ def generate_scenario_data(
         data['aux_energy_drain_kwh'][i] = aux_energy_drain
         data['regen_energy_gain_kwh'][i] = regen_energy_gain
         data['soc_percent'][i] = current_soc_percent
-        #data['battery_temp'][i] = battery_temp
         data['distance_km'][i] = distance_step_km
-        #data['energy_consumed_kwh'][i] = total_energy
+        data['remaining_energy_kwh'][i] = remaining_energy
         data['remaining_range_km'][i] = remaining_range_km
+    
+    # Truncate arrays to actual steps completed (in case simulation ended early)
+    for key in data:
+        data[key] = data[key][:actual_steps]
     
     return pd.DataFrame(data)
 
@@ -812,110 +812,418 @@ def save_scenario_to_csv(df: pd.DataFrame, scenario_name: str, output_dir: str =
 
 
 # =============================================================================
+# Training Data Generation
+# =============================================================================
+
+def generate_training_dataset(
+    num_scenarios: int = 100,
+    output_dir: str = 'training_data',
+    random_seed: Optional[int] = 42
+) -> pd.DataFrame:
+    """
+    Generate diverse training data for predicting remaining battery energy and range.
+    
+    Creates multiple scenarios with varied parameters:
+    - Initial SOC: 20% to 100%
+    - Speed: 20 to 120 km/h
+    - Grade: -10% to +10%
+    - Vehicle mass: 1200 to 2500 kg
+    - Battery capacity: 40 to 200 kWh
+    
+    Args:
+        num_scenarios: Number of different scenarios to generate
+        output_dir: Directory to save the training data
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        Combined DataFrame with all training data
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
+    env = EnvironmentParams()
+    all_data = []
+    
+    print(f"Generating {num_scenarios} training scenarios...")
+    
+    for scenario_id in range(num_scenarios):
+        # Randomize vehicle parameters
+        vehicle = VehicleParams(
+            mass=np.random.uniform(1200, 2500),
+            battery_capacity=np.random.uniform(40, 200),
+            u_roll=np.random.uniform(0.001, 0.003),
+            K_regen=np.random.uniform(0.1, 0.3),
+            P_aux=np.random.uniform(0.02, 0.1),
+            P_heat=np.random.uniform(0.005, 0.02)
+        )
+        
+        # Randomize driving parameters
+        initial_soc = np.random.uniform(20, 100)
+        speed = np.random.uniform(20, 120)
+        grade = np.random.uniform(-10, 10)
+        
+        # Randomize duration (10 min to 2 hours)
+        duration_sec = int(np.random.uniform(600, 7200))
+        window_size_sec = np.random.choice([15, 30, 60])
+        
+        # Generate scenario data
+        df = generate_scenario_data(
+            drive_duration_sec=duration_sec,
+            window_size_sec=window_size_sec,
+            speed_kmph=speed,
+            initial_soc_percent=initial_soc,
+            grade=grade,
+            vehicle=vehicle,
+            env=env
+        )
+        
+        # Add scenario identifier
+        df['scenario_id'] = scenario_id
+        
+        # Filter out rows where simulation stopped (SOC depleted)
+        df = df[df['soc_percent'] > 0]
+        
+        if len(df) > 0:
+            all_data.append(df)
+        
+        if (scenario_id + 1) % 20 == 0:
+            print(f"  Generated {scenario_id + 1}/{num_scenarios} scenarios")
+    
+    # Combine all scenarios
+    combined_df = pd.concat(all_data, ignore_index=True)
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save full training dataset
+    full_path = os.path.join(output_dir, 'ev_training_data.csv')
+    combined_df.to_csv(full_path, index=False)
+    print(f"\nSaved full training dataset: {full_path}")
+    print(f"  Total samples: {len(combined_df)}")
+    
+    # Create ML-ready dataset with selected features and targets
+    ml_features = [
+        'avg_speed_kmh',
+        'grade', 
+        'vehicle_mass',
+        'battery_capacity_kwh',
+        'soc_percent',
+        'distance_km'
+    ]
+    ml_targets = ['remaining_energy_kwh', 'remaining_range_km']
+    
+    ml_df = combined_df[ml_features + ml_targets].copy()
+    ml_path = os.path.join(output_dir, 'ev_ml_dataset.csv')
+    ml_df.to_csv(ml_path, index=False)
+    print(f"Saved ML-ready dataset: {ml_path}")
+    
+    # Print dataset statistics
+    print("\n" + "=" * 50)
+    print("Training Data Statistics")
+    print("=" * 50)
+    print("\nFeature Ranges:")
+    for col in ml_features:
+        print(f"  {col}: [{combined_df[col].min():.2f}, {combined_df[col].max():.2f}]")
+    print("\nTarget Ranges:")
+    for col in ml_targets:
+        print(f"  {col}: [{combined_df[col].min():.2f}, {combined_df[col].max():.2f}]")
+    
+    return combined_df
+
+
+def generate_varying_speed_scenario(
+    drive_duration_sec: int = 3600,
+    window_size_sec: int = 30,
+    initial_soc_percent: float = 90.0,
+    vehicle: Optional[VehicleParams] = None,
+    env: Optional[EnvironmentParams] = None
+) -> pd.DataFrame:
+    """
+    Generate scenario with varying speed and grade over time.
+    
+    Simulates realistic driving with speed and grade changes.
+    """
+    vehicle = vehicle or VehicleParams()
+    env = env or EnvironmentParams()
+    
+    time_steps = int(drive_duration_sec / window_size_sec)
+    
+    # Generate varying speed profile (urban/highway mix)
+    speeds = np.zeros(time_steps)
+    grades = np.zeros(time_steps)
+    
+    base_speed = np.random.uniform(40, 80)
+    base_grade = 0
+    
+    for i in range(time_steps):
+        # Speed variation (smooth changes)
+        speed_change = np.random.uniform(-10, 10)
+        speeds[i] = np.clip(base_speed + speed_change, 20, 120)
+        base_speed = speeds[i] * 0.9 + base_speed * 0.1  # Smoothing
+        
+        # Grade variation (occasional hills)
+        if np.random.random() < 0.1:  # 10% chance of grade change
+            base_grade = np.random.uniform(-8, 8)
+        grades[i] = base_grade + np.random.uniform(-1, 1)
+    
+    # Initialize data storage
+    all_rows = []
+    current_soc_percent = initial_soc_percent
+    timeWindow = TimeWindowParams()
+    timeWindow.time = window_size_sec
+    
+    for i in range(time_steps):
+        if current_soc_percent <= 1:
+            break
+            
+        timeWindow.speed = speeds[i]
+        timeWindow.grade = grades[i]
+        
+        # Calculate energy
+        step_energy_spend, motion_energy, gravity_energy, heat_energy, aux_energy, regen_energy = \
+            calculate_energy_loss_in_time_window(vehicle, env, timeWindow)
+        
+        # Update SOC
+        current_soc_percent -= (step_energy_spend / vehicle.battery_capacity) * 100
+        
+        # Calculate remaining energy and range
+        remaining_energy = max(0, (current_soc_percent / 100) * vehicle.battery_capacity)
+        distance_km = speeds[i] * (window_size_sec / 3600.0)
+        
+        if current_soc_percent > 0 and step_energy_spend > 0:
+            energy_per_km = step_energy_spend / distance_km
+            remaining_range = remaining_energy / energy_per_km
+        else:
+            remaining_range = 0
+        
+        row = {
+            'time_stamp_sec': i * window_size_sec,
+            'window_duration_sec': window_size_sec,
+            'avg_speed_kmh': speeds[i],
+            'grade': grades[i],
+            'vehicle_mass': vehicle.mass,
+            'battery_capacity_kwh': vehicle.battery_capacity,
+            'battery_energy_spend_kwh': step_energy_spend,
+            'motion_energy_drain_kwh': motion_energy,
+            'gravity_energy_drain_kwh': gravity_energy,
+            'heat_energy_drain_kwh': heat_energy,
+            'aux_energy_drain_kwh': aux_energy,
+            'regen_energy_gain_kwh': regen_energy,
+            'soc_percent': current_soc_percent,
+            'distance_km': distance_km,
+            'remaining_energy_kwh': remaining_energy,
+            'remaining_range_km': remaining_range
+        }
+        all_rows.append(row)
+    
+    return pd.DataFrame(all_rows)
+
+
+def generate_mixed_training_dataset(
+    num_constant_scenarios: int = 50,
+    num_varying_scenarios: int = 50,
+    output_dir: str = 'training_data',
+    random_seed: Optional[int] = 42
+) -> pd.DataFrame:
+    """
+    Generate mixed training dataset with both constant and varying speed scenarios.
+    
+    Args:
+        num_constant_scenarios: Number of constant speed scenarios
+        num_varying_scenarios: Number of varying speed/grade scenarios
+        output_dir: Directory to save training data
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        Combined DataFrame with all training data
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    
+    env = EnvironmentParams()
+    all_data = []
+    scenario_id = 0
+    
+    print("Generating mixed training dataset...")
+    
+    # Generate constant speed scenarios
+    print(f"\nGenerating {num_constant_scenarios} constant speed scenarios...")
+    for i in range(num_constant_scenarios):
+        vehicle = VehicleParams(
+            mass=np.random.uniform(1200, 2500),
+            battery_capacity=np.random.uniform(40, 200),
+            u_roll=np.random.uniform(0.001, 0.003),
+            K_regen=np.random.uniform(0.1, 0.3),
+            P_aux=np.random.uniform(0.02, 0.1),
+            P_heat=np.random.uniform(0.005, 0.02)
+        )
+        
+        df = generate_scenario_data(
+            drive_duration_sec=int(np.random.uniform(600, 7200)),
+            window_size_sec=np.random.choice([15, 30, 60]),
+            speed_kmph=np.random.uniform(20, 120),
+            initial_soc_percent=np.random.uniform(20, 100),
+            grade=np.random.uniform(-10, 10),
+            vehicle=vehicle,
+            env=env
+        )
+        
+        df['scenario_id'] = scenario_id
+        df['scenario_type'] = 'constant'
+        df = df[df['soc_percent'] > 0]
+        
+        if len(df) > 0:
+            all_data.append(df)
+        scenario_id += 1
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Constant: {i + 1}/{num_constant_scenarios}")
+    
+    # Generate varying speed scenarios
+    print(f"\nGenerating {num_varying_scenarios} varying speed scenarios...")
+    for i in range(num_varying_scenarios):
+        vehicle = VehicleParams(
+            mass=np.random.uniform(1200, 2500),
+            battery_capacity=np.random.uniform(40, 200),
+            u_roll=np.random.uniform(0.001, 0.003),
+            K_regen=np.random.uniform(0.1, 0.3),
+            P_aux=np.random.uniform(0.02, 0.1),
+            P_heat=np.random.uniform(0.005, 0.02)
+        )
+        
+        df = generate_varying_speed_scenario(
+            drive_duration_sec=int(np.random.uniform(600, 7200)),
+            window_size_sec=np.random.choice([15, 30, 60]),
+            initial_soc_percent=np.random.uniform(20, 100),
+            vehicle=vehicle,
+            env=env
+        )
+        
+        df['scenario_id'] = scenario_id
+        df['scenario_type'] = 'varying'
+        df = df[df['soc_percent'] > 0]
+        
+        if len(df) > 0:
+            all_data.append(df)
+        scenario_id += 1
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Varying: {i + 1}/{num_varying_scenarios}")
+    
+    # Combine all data
+    combined_df = pd.concat(all_data, ignore_index=True)
+    
+    # Save datasets
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Full dataset
+    full_path = os.path.join(output_dir, 'ev_mixed_training_data.csv')
+    combined_df.to_csv(full_path, index=False)
+    print(f"\nSaved mixed training dataset: {full_path}")
+    print(f"  Total samples: {len(combined_df)}")
+    
+    # ML-ready dataset
+    ml_features = [
+        'avg_speed_kmh',
+        'grade',
+        'vehicle_mass', 
+        'battery_capacity_kwh',
+        'soc_percent',
+        'distance_km'
+    ]
+    ml_targets = ['remaining_energy_kwh', 'remaining_range_km']
+    
+    ml_df = combined_df[ml_features + ml_targets].copy()
+    ml_path = os.path.join(output_dir, 'ev_ml_dataset.csv')
+    ml_df.to_csv(ml_path, index=False)
+    print(f"Saved ML-ready dataset: {ml_path}")
+    
+    # Statistics
+    print("\n" + "=" * 50)
+    print("Training Data Statistics")
+    print("=" * 50)
+    print(f"\nScenarios: {len(combined_df['scenario_id'].unique())}")
+    print(f"  Constant speed: {len(combined_df[combined_df['scenario_type'] == 'constant']['scenario_id'].unique())}")
+    print(f"  Varying speed: {len(combined_df[combined_df['scenario_type'] == 'varying']['scenario_id'].unique())}")
+    print("\nFeature Ranges:")
+    for col in ml_features:
+        print(f"  {col}: [{combined_df[col].min():.2f}, {combined_df[col].max():.2f}]")
+    print("\nTarget Ranges:")
+    for col in ml_targets:
+        print(f"  {col}: [{combined_df[col].min():.2f}, {combined_df[col].max():.2f}]")
+    
+    return combined_df
+
+
+# =============================================================================
 # Main Function
 # =============================================================================
 
 def main():
-    """Main function to generate and demonstrate EV energy model data"""
+    """Main function to generate EV energy model training data"""
     
     print("=" * 70)
-    print("EV Range Prediction - Data Generation")
+    print("EV Range & Energy Prediction - Training Data Generation")
     print("=" * 70)
     
-    # Initialize parameters
+    # Initialize default parameters
     vehicle = VehicleParams()
     env = EnvironmentParams()
-    drive_duration_sec = 3600 # sec
-    window_size_sec = 30 # sec
-    speed_kmph = 80 # km / h
-    initial_soc_percent = 90 # percent of vehicle batter capacity 
     
-    print("\nVehicle Parameters:")
+    print("\nDefault Vehicle Parameters:")
     print(f"  Mass: {vehicle.mass} kg")
     print(f"  Battery Capacity: {vehicle.battery_capacity} kWh")
-    #print(f"  Motor Efficiency (K_m): {vehicle.K_m}")
-    #print(f"  Regen Efficiency (K_r): {vehicle.K_r}")
+    print(f"  Rolling Resistance (u_roll): {vehicle.u_roll}")
+    print(f"  Regen Coefficient (K_regen): {vehicle.K_regen}")
     
-    # Generate individual scenario demonstrations
+    # Generate a sample scenario for demonstration
     print("\n" + "=" * 70)
-    print("Generating Individual Scenarios...")
+    print("Generating Sample Scenario...")
     print("=" * 70)
     
-    # Scenario 1: Level road, constant speed
-    print("\n[Scenario 1] Level road, constant speed (80 km/h)...")
-    df1 = generate_scenario_data(drive_duration_sec, window_size_sec, speed_kmph, initial_soc_percent)
-    #print(f"  Duration: 600 minutes")
-    print(f"  Final SOC: {df1['soc_percent'].iloc[-1]:.1f}%")
-    print(f"  Distance traveled: {df1['distance_km'].iloc[-1]:.1f} km")
-    #print(f"  Energy consumed: {df1['energy_consumed_kwh'].iloc[-1]:.2f} kWh")
-    save_scenario_to_csv(df1, "scenario_1_level_constant_speed")
-
-
-"""
-
-    # Scenario 2: Level road, varying speed
-    print("\n[Scenario 2] Level road, varying speed (urban driving)...")
-    df2 = generate_scenario_2_level_varying(duration=1800, initial_soc=90)
-    print(f"  Duration: 30 minutes")
-    print(f"  Final SOC: {df2['soc'].iloc[-1]:.1f}%")
-    print(f"  Distance traveled: {df2['distance_km'].iloc[-1]:.1f} km")
-    print(f"  Energy consumed: {df2['energy_consumed_kwh'].iloc[-1]:.2f} kWh")
-    print(f"  Max regen power: {df2['regen_power_kw'].max():.2f} kW")
-    save_scenario_to_csv(df2, "scenario_2_level_varying_speed")
+    drive_duration_sec = 3600  # 1 hour
+    window_size_sec = 30
+    speed_kmph = 80
+    initial_soc_percent = 90
     
-    # Scenario 3: Uphill
-    print("\n[Scenario 3] Uphill driving (5% grade, 60 km/h)...")
-    df3 = generate_scenario_3_uphill(duration=900, speed_kmh=60, grade_percent=5, initial_soc=90)
-    print(f"  Duration: 15 minutes")
-    print(f"  Final SOC: {df3['soc'].iloc[-1]:.1f}%")
-    print(f"  Distance traveled: {df3['distance_km'].iloc[-1]:.1f} km")
-    print(f"  Energy consumed: {df3['energy_consumed_kwh'].iloc[-1]:.2f} kWh")
-    print(f"  Avg power demand: {df3['battery_power_kw'].mean():.2f} kW")
-    save_scenario_to_csv(df3, "scenario_3_uphill_driving")
+    print(f"\nSample scenario: Level road, constant speed ({speed_kmph} km/h)")
+    df_sample = generate_scenario_data(
+        drive_duration_sec, window_size_sec, speed_kmph, initial_soc_percent,
+        vehicle=vehicle, env=env
+    )
+    print(f"  Duration: {drive_duration_sec/60:.0f} minutes")
+    print(f"  Final SOC: {df_sample['soc_percent'].iloc[-1]:.1f}%")
+    print(f"  Final remaining energy: {df_sample['remaining_energy_kwh'].iloc[-1]:.1f} kWh")
+    print(f"  Final remaining range: {df_sample['remaining_range_km'].iloc[-1]:.1f} km")
+    print(f"  Distance traveled: {df_sample['distance_km'].sum():.1f} km")
+    save_scenario_to_csv(df_sample, "sample_scenario")
     
-    # Scenario 4: Downhill
-    print("\n[Scenario 4] Downhill driving (-5% grade, 60 km/h)...")
-    df4 = generate_scenario_4_downhill(duration=900, speed_kmh=60, grade_percent=-5, initial_soc=70)
-    print(f"  Duration: 15 minutes")
-    print(f"  Final SOC: {df4['soc'].iloc[-1]:.1f}%")
-    print(f"  Distance traveled: {df4['distance_km'].iloc[-1]:.1f} km")
-    print(f"  Energy regenerated via regen braking: {df4['regen_power_kw'].sum() * 1/3600:.2f} kWh")
-    save_scenario_to_csv(df4, "scenario_4_downhill_driving")
-    
-    # Generate full training dataset
+    # Generate training dataset
     print("\n" + "=" * 70)
-    print("Generating Mixed Training Dataset...")
+    print("Generating Training Dataset for ML Models...")
     print("=" * 70)
     
-    X, y = generate_mixed_scenario_dataset(num_samples_per_scenario=2500)
-    
-    # Feature statistics
-    print("\nFeature Statistics:")
-    feature_names = ['SOC (%)', 'Voltage (V)', 'Temp (°C)', 'Speed (km/h)', 
-                     'Avg Speed (km/h)', 'Current (A)', 'SOH (%)']
-    for i, name in enumerate(feature_names):
-        print(f"  {name}: min={X[:, i].min():.2f}, max={X[:, i].max():.2f}, mean={X[:, i].mean():.2f}")
-    
-    print(f"\nTarget (Remaining Range) Statistics:")
-    print(f"  Min: {y.min():.2f} km")
-    print(f"  Max: {y.max():.2f} km")
-    print(f"  Mean: {y.mean():.2f} km")
-    
-    # Save dataset
-    save_dataset(X, y, 'ev_training_dataset.pt')
+    # Generate mixed training data (constant + varying speed scenarios)
+    training_df = generate_mixed_training_dataset(
+        num_constant_scenarios=50,
+        num_varying_scenarios=50,
+        output_dir='training_data',
+        random_seed=42
+    )
     
     print("\n" + "=" * 70)
-    print("Data generation complete!")
+    print("Data Generation Complete!")
     print("=" * 70)
     print("\nOutput files:")
-    print("  - scenario_data/scenario_1_level_constant_speed.csv")
-    print("  - scenario_data/scenario_2_level_varying_speed.csv")
-    print("  - scenario_data/scenario_3_uphill_driving.csv")
-    print("  - scenario_data/scenario_4_downhill_driving.csv")
-    print("  - ev_training_dataset.pt (PyTorch tensor dataset)")
+    print("  - scenario_data/sample_scenario.csv (single scenario demo)")
+    print("  - training_data/ev_mixed_training_data.csv (full training data)")
+    print("  - training_data/ev_ml_dataset.csv (ML-ready features + targets)")
+    print("\nML Dataset columns:")
+    print("  Features: avg_speed_kmh, grade, vehicle_mass, battery_capacity_kwh,")
+    print("            soc_percent, distance_km")
+    print("  Targets:  remaining_energy_kwh, remaining_range_km")
     
-    return X, y
-"""
+    return training_df
 
 
 if __name__ == "__main__":
