@@ -44,6 +44,8 @@ import pandas as pd
 from dataclasses import dataclass
 from typing import Tuple, List, Optional
 import torch
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 
 # =============================================================================
@@ -58,11 +60,11 @@ class VehicleParams:
     #frontal_area: float = 2.5          # Frontal area (m^2)
     #drag_coeff: float = 0.28           # Aerodynamic drag coefficient
     #rolling_resistance: float = 0.012  # Rolling resistance coefficient
-    u_roll: float = 0.002               # Rolling resistance coefficient
+    u_roll: float = 0.08               # Rolling resistance coefficient
     #K_m: float = 0.75                  # Motor efficiency (battery to kinetic)
     K_regen: float = 0.2                # Ratio of translation motion energy that is regenerated
-    P_aux: float = 0.05                  # Auxiliary systems power consumption (kW)
-    P_heat: float = 0.01                 # Battery thermal loss (kW)
+    P_aux: float = 0.5                  # Auxiliary systems power consumption (kW)
+    P_heat: float = 0.5                 # Battery thermal loss (kW)
 
 
 
@@ -103,16 +105,16 @@ def calculate_E_motion(
     grade: float = 0.0
 ) -> float:
     """
-    Calculate rolling resistance force.
+    Calculate rolling resistance energy.
     F_roll = Crr * m * g * cos(theta)
-    E_roll = F_roll * time
+    E_roll = F_roll * distance
     """
     theta = np.arctan(grade / 100)  # Convert grade percentage to angle
-    surface_distance = (timeWindow.speed * 1000.0/3600.0) * timeWindow.time # convert speed from km/hr to m/s
+    surface_distance = (timeWindow.speed * 1000.0/3600.0) * timeWindow.time  # meters
     
-    # E_motion = u_roll * M * g * cos(theta) * distance 
- 
-    return vehicle.u_roll * vehicle.mass * env.gravity * np.cos(theta) * surface_distance / 1000.0 /60.0 # convert to kW hour
+    # E_motion = u_roll * M * g * cos(theta) * distance
+    # Convert Joules to kWh: divide by 1000 (to kJ) and 3600 (to kWh)
+    return vehicle.u_roll * vehicle.mass * env.gravity * np.cos(theta) * surface_distance / 1000.0 / 3600.0
 
 
 def calculate_E_grav(
@@ -122,37 +124,43 @@ def calculate_E_grav(
     grade: float = 0.0
 ) -> float:
     """
-    Calculate gravitational force due to road grade.
-    F_grade = m * g * sin(theta)
-    E_grav = F_grade * distance * sin(theta)
-    Positive for uphill, negative for downhill
+    Calculate gravitational energy due to road grade.
+    E_grav = m * g * h = m * g * sin(theta) * distance
+    Positive for uphill (energy consumed), negative for downhill (energy gained)
     """
-    theta = np.arctan(grade / 100)
-    vert_distance = (timeWindow.speed * 1000.0/3600.0) * timeWindow.time * np.sin(theta)
-    return vehicle.mass * env.gravity * np.sin(theta) * vert_distance / 1000.0 / 60.0 # convert to kW hour
+    theta = np.arctan(grade / 100)  # Convert grade percentage to angle
+    horizontal_distance = (timeWindow.speed * 1000.0/3600.0) * timeWindow.time  # meters
+    height_change = horizontal_distance * np.sin(theta)  # vertical height gained/lost
+    # E = m * g * h, convert to kWh
+    return vehicle.mass * env.gravity * height_change / 1000.0 / 3600.0
 
 
 
 def calculate_energy_loss_in_time_window(
-    #speed: float,
-    #acceleration: float,
-    #grade: float,
     vehicle: VehicleParams,
     env: EnvironmentParams,
     timeWindow: TimeWindowParams
 ) -> float:
+    """
+    Calculate total energy loss in a time window.
     
+    Returns:
+        Tuple of (total_loss, motion_energy, gravity_energy, heat_energy, aux_energy, regen_energy)
+        All values in kWh
+    """
+    grade = timeWindow.grade  # Get grade from time window
     
+    E_motion = calculate_E_motion(vehicle, env, timeWindow, grade)  # kWh
+    E_grav = calculate_E_grav(vehicle, env, timeWindow, grade)  # kWh (positive uphill, negative downhill)
     
-    E_motion = calculate_E_motion(vehicle, env, timeWindow)
-    E_grav = calculate_E_grav(vehicle, env, timeWindow)
-    E_heat = vehicle.P_heat * timeWindow.time
-    E_aux = vehicle.P_aux * timeWindow.time
+    # P_heat and P_aux are in kW, time is in seconds
+    # E = P * t, convert seconds to hours: t/3600
+    E_heat = vehicle.P_heat * timeWindow.time / 3600.0  # kWh
+    E_aux = vehicle.P_aux * timeWindow.time / 3600.0  # kWh
 
-    E_regen = vehicle.K_regen *  E_motion
+    E_regen = vehicle.K_regen * E_motion  # kWh
 
     E_total_loss = E_motion + E_grav + E_heat + E_aux - E_regen
-
        
     return E_total_loss, E_motion, E_grav, E_heat, E_aux, E_regen
 
@@ -205,7 +213,8 @@ def calculate_energy_loss_in_time_window(
 def generate_scenario_data(
     drive_duration_sec: int = 36000,
     window_size_sec: int = 15,
-    speed_kmph: float = 40.0,
+    avg_speed_kmph: float = 40.0,
+    std_speed_kmph: float = 5.0,
     initial_soc_percent: float = 95.0,
     grade: Optional[float] = 0,
     vehicle: Optional[VehicleParams] = None,
@@ -228,31 +237,31 @@ def generate_scenario_data(
     vehicle = vehicle or VehicleParams()
     env = env or EnvironmentParams()
     timeWindow = TimeWindowParams()
-    timeWindow.speed = speed_kmph
+    timeWindow.speed = avg_speed_kmph #+ np.random.normal(0, std_speed_kmph)
     timeWindow.time = window_size_sec
-
+    timeWindow.grade = grade  # Set the grade for energy calculations
     
-    #velocity = speed_kmph / 3.6  # Convert to m/s
     time_steps = int(drive_duration_sec / window_size_sec)
     
     # Initialize arrays
     time_sec = np.arange(0, drive_duration_sec, window_size_sec)
     data = {
-        'time_stamp_sec': time_sec,
-        'window_duration_sec': np.full(time_steps, window_size_sec),
-        'avg_speed_kmh': np.full(time_steps, speed_kmph),
-        'grade': np.full(time_steps, grade),
-        'vehicle_mass': np.full(time_steps, vehicle.mass),
-        'battery_capacity_kwh': np.full(time_steps, vehicle.battery_capacity),
-        'battery_energy_spend_kwh': np.zeros(time_steps),
-        'motion_energy_drain_kwh': np.zeros(time_steps),
-        'gravity_energy_drain_kwh': np.zeros(time_steps),
-        'heat_energy_drain_kwh': np.zeros(time_steps),
-        'aux_energy_drain_kwh': np.zeros(time_steps),
-        'regen_energy_gain_kwh': np.zeros(time_steps),
         'soc_percent': np.zeros(time_steps),
-        'distance_km': np.zeros(time_steps),
-        'remaining_energy_kwh': np.zeros(time_steps),
+        'delta_soc_percent': np.zeros(time_steps),
+        'battery_energy_spend_kwh': np.zeros(time_steps),
+        'regen_energy_gain_kwh': np.zeros(time_steps),
+        'avg_speed_kmph': np.full(time_steps, avg_speed_kmph),
+        #'time_stamp_sec': time_sec,
+        #'window_duration_sec': np.full(time_steps, window_size_sec),
+        #'grade': np.full(time_steps, grade),
+        'vehicle_mass_kg': np.full(time_steps, vehicle.mass),
+        #'battery_capacity_kwh': np.full(time_steps, vehicle.battery_capacity),
+        #'motion_energy_drain_kwh': np.zeros(time_steps),
+        #'gravity_energy_drain_kwh': np.zeros(time_steps),
+        #'heat_energy_drain_kwh': np.zeros(time_steps),
+        #'aux_energy_drain_kwh': np.zeros(time_steps),
+        'distance_step_km': np.zeros(time_steps),
+        #'remaining_energy_kwh': np.zeros(time_steps),
         'remaining_range_km': np.zeros(time_steps),
     }
     
@@ -265,9 +274,7 @@ def generate_scenario_data(
 
         if current_soc_percent <= 1: # stop when soc is < 1%
             break
-        
         actual_steps += 1
-
 
         # Calculate energy spent from battery in time window
         step_energy_spend, motion_energy_drain, gravity_energy_drain, heat_energy_drain, aux_energy_drain, regen_energy_gain  = calculate_energy_loss_in_time_window(
@@ -275,35 +282,44 @@ def generate_scenario_data(
         )
         
         # Update energy and SOC
-        #energy_step = (battery_power + heat_loss) * dt / 3600  # kWh
-        #total_energy += energy_step
         current_soc_percent -= (step_energy_spend / vehicle.battery_capacity) * 100
+        # Cap SOC at 100% (can't charge above full capacity)
+        current_soc_percent = min(100.0, current_soc_percent)
         
         # Update distance
-        distance_step_km = speed_kmph * (window_size_sec /3600.0) 
+        distance_step_km = timeWindow.speed * (window_size_sec / 3600.0) 
         total_distance_km += distance_step_km
-        
-        # Update battery temperature (simplified)
-        #battery_temp += (battery_power * 0.01 - 0.05 * (battery_temp - env.ambient_temp)) * dt / 60
         
         # Calculate remaining energy and range
         remaining_energy = max(0, (current_soc_percent / 100) * vehicle.battery_capacity)
-        if current_soc_percent > 0 and step_energy_spend > 0:
-            energy_spend_per_km = step_energy_spend / distance_step_km   # kWh/km
-            remaining_range_km = remaining_energy / energy_spend_per_km
-        else:
-            remaining_range_km = 0
+        
+        # Calculate remaining range based on current energy consumption rate
+        #if step_energy_spend > 0.0001:  # Positive energy consumption
+        
+        energy_spend_per_km = step_energy_spend / distance_step_km  # kWh/km
+        remaining_range_km = remaining_energy / energy_spend_per_km
+        
+            # Cap at reasonable maximum (e.g., 2000 km for an EV)
+            #remaining_range_km = min(remaining_range_km, 2000.0)
+        #elif step_energy_spend <= 0:  # Energy gain (downhill) or no consumption
+        #    # Use a conservative estimate based on typical EV efficiency (0.15 kWh/km)
+        #    remaining_range_km = remaining_energy / 0.15
+        #    remaining_range_km = min(remaining_range_km, 2000.0)
+        #else:
+        #    remaining_range_km = 0
         
         # Store data
-        data['battery_energy_spend_kwh'][i] = step_energy_spend
-        data['motion_energy_drain_kwh'][i] = motion_energy_drain
-        data['gravity_energy_drain_kwh'][i] = gravity_energy_drain
-        data['heat_energy_drain_kwh'][i] = heat_energy_drain
-        data['aux_energy_drain_kwh'][i] = aux_energy_drain
-        data['regen_energy_gain_kwh'][i] = regen_energy_gain
         data['soc_percent'][i] = current_soc_percent
-        data['distance_km'][i] = distance_step_km
-        data['remaining_energy_kwh'][i] = remaining_energy
+        data['delta_soc_percent'][i] = (step_energy_spend / vehicle.battery_capacity) * 100
+        data['battery_energy_spend_kwh'][i] = step_energy_spend
+        #data['motion_energy_drain_kwh'][i] = motion_energy_drain
+        #data['gravity_energy_drain_kwh'][i] = gravity_energy_drain
+        ##data['heat_energy_drain_kwh'][i] = heat_energy_drain
+        #data['aux_energy_drain_kwh'][i] = aux_energy_drain
+        data['regen_energy_gain_kwh'][i] = regen_energy_gain
+        data['avg_speed_kmph'][i] = timeWindow.speed
+        data['distance_step_km'][i] = distance_step_km
+        #data['remaining_energy_kwh'][i] = remaining_energy
         data['remaining_range_km'][i] = remaining_range_km
     
     # Truncate arrays to actual steps completed (in case simulation ended early)
@@ -812,6 +828,453 @@ def save_scenario_to_csv(df: pd.DataFrame, scenario_name: str, output_dir: str =
 
 
 # =============================================================================
+# Plotting Functions
+# =============================================================================
+
+def plot_uphill_scenario(
+    speed_kmph: float = 60.0,
+    grade: float = 5.0,
+    initial_soc_percent: float = 90.0,
+    drive_duration_sec: int = 3600,
+    window_size_sec: int = 30,
+    vehicle: Optional[VehicleParams] = None,
+    env: Optional[EnvironmentParams] = None,
+    output_dir: str = 'plots',
+    save_plot: bool = True
+) -> plt.Figure:
+    """
+    Generate and plot an uphill driving scenario.
+    
+    Args:
+        speed_kmph: Vehicle speed (km/h)
+        grade: Road grade (positive for uphill, %)
+        initial_soc_percent: Initial state of charge (%)
+        drive_duration_sec: Duration of drive (seconds)
+        window_size_sec: Time window size (seconds)
+        vehicle: Vehicle parameters
+        env: Environment parameters
+        output_dir: Directory to save plots
+        save_plot: Whether to save the plot to file
+    
+    Returns:
+        Matplotlib figure object
+    """
+    vehicle = vehicle or VehicleParams()
+    env = env or EnvironmentParams()
+    
+    # Ensure positive grade for uphill
+    grade = abs(grade)
+    
+    # Generate scenario data
+    df = generate_scenario_data(
+        drive_duration_sec=drive_duration_sec,
+        window_size_sec=window_size_sec,
+        speed_kmph=speed_kmph,
+        initial_soc_percent=initial_soc_percent,
+        grade=grade,
+        vehicle=vehicle,
+        env=env
+    )
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(14, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+    
+    time_min = df['time_stamp_sec'] / 60
+    
+    # Plot 1: SOC and Remaining Energy
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1_twin = ax1.twinx()
+    
+    line1 = ax1.plot(time_min, df['soc_percent'], 'b-', linewidth=2, label='SOC (%)')
+    line2 = ax1_twin.plot(time_min, df['remaining_energy_kwh'], 'g--', linewidth=2, label='Remaining Energy (kWh)')
+    
+    ax1.set_xlabel('Time (minutes)', fontsize=11)
+    ax1.set_ylabel('State of Charge (%)', color='b', fontsize=11)
+    ax1_twin.set_ylabel('Remaining Energy (kWh)', color='g', fontsize=11)
+    ax1.tick_params(axis='y', labelcolor='b')
+    ax1_twin.tick_params(axis='y', labelcolor='g')
+    ax1.set_title('Battery State - Uphill Driving', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    
+    # Plot 2: Remaining Range
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(time_min, df['remaining_range_km'], 'r-', linewidth=2)
+    ax2.fill_between(time_min, 0, df['remaining_range_km'], alpha=0.3, color='r')
+    ax2.set_xlabel('Time (minutes)', fontsize=11)
+    ax2.set_ylabel('Remaining Range (km)', fontsize=11)
+    ax2.set_title('Remaining Range - Uphill Driving', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Energy Breakdown (stacked area)
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    # Cumulative energy values
+    cum_motion = df['motion_energy_drain_kwh'].cumsum()
+    cum_gravity = df['gravity_energy_drain_kwh'].cumsum()
+    cum_heat = df['heat_energy_drain_kwh'].cumsum()
+    cum_aux = df['aux_energy_drain_kwh'].cumsum()
+    cum_regen = df['regen_energy_gain_kwh'].cumsum()
+    
+    ax3.stackplot(time_min, cum_motion, cum_gravity, cum_heat, cum_aux,
+                  labels=['Motion', 'Gravity (uphill)', 'Heat Loss', 'Auxiliary'],
+                  colors=['#2ecc71', '#e74c3c', '#f39c12', '#9b59b6'], alpha=0.8)
+    ax3.plot(time_min, cum_regen, 'k--', linewidth=2, label='Regen (gain)')
+    
+    ax3.set_xlabel('Time (minutes)', fontsize=11)
+    ax3.set_ylabel('Cumulative Energy (kWh)', fontsize=11)
+    ax3.set_title('Energy Breakdown - Uphill Driving', fontsize=12, fontweight='bold')
+    ax3.legend(loc='upper left', fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Energy consumption rate per time window
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    width = 0.35
+    x = np.arange(min(20, len(df)))  # Show first 20 windows or all if less
+    
+    if len(df) > 20:
+        # Sample evenly spaced indices
+        indices = np.linspace(0, len(df)-1, 20, dtype=int)
+        df_sample = df.iloc[indices]
+        x_labels = [f"{t:.0f}" for t in df_sample['time_stamp_sec']/60]
+    else:
+        df_sample = df
+        x_labels = [f"{t:.0f}" for t in df_sample['time_stamp_sec']/60]
+    
+    bars1 = ax4.bar(x - width/2, df_sample['gravity_energy_drain_kwh']*1000, width, 
+                    label='Gravity (Wh)', color='#e74c3c', alpha=0.8)
+    bars2 = ax4.bar(x + width/2, df_sample['motion_energy_drain_kwh']*1000, width,
+                    label='Motion (Wh)', color='#2ecc71', alpha=0.8)
+    
+    ax4.set_xlabel('Time (minutes)', fontsize=11)
+    ax4.set_ylabel('Energy per Window (Wh)', fontsize=11)
+    ax4.set_title('Energy Components per Window - Uphill', fontsize=12, fontweight='bold')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(x_labels, rotation=45, ha='right')
+    ax4.legend(loc='upper right')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add overall title
+    fig.suptitle(f'Uphill Driving Scenario: {speed_kmph:.0f} km/h, {grade:.1f}% grade, {vehicle.mass:.0f} kg vehicle',
+                 fontsize=14, fontweight='bold', y=0.98)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, f'uphill_scenario_{grade:.0f}pct_grade.png')
+        fig.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"  Saved plot: {filepath}")
+    
+    return fig
+
+
+def plot_downhill_scenario(
+    speed_kmph: float = 60.0,
+    grade: float = -5.0,
+    initial_soc_percent: float = 70.0,
+    drive_duration_sec: int = 3600,
+    window_size_sec: int = 30,
+    vehicle: Optional[VehicleParams] = None,
+    env: Optional[EnvironmentParams] = None,
+    output_dir: str = 'plots',
+    save_plot: bool = True
+) -> plt.Figure:
+    """
+    Generate and plot a downhill driving scenario.
+    
+    Args:
+        speed_kmph: Vehicle speed (km/h)
+        grade: Road grade (negative for downhill, %)
+        initial_soc_percent: Initial state of charge (%)
+        drive_duration_sec: Duration of drive (seconds)
+        window_size_sec: Time window size (seconds)
+        vehicle: Vehicle parameters
+        env: Environment parameters
+        output_dir: Directory to save plots
+        save_plot: Whether to save the plot to file
+    
+    Returns:
+        Matplotlib figure object
+    """
+    vehicle = vehicle or VehicleParams()
+    env = env or EnvironmentParams()
+    
+    # Ensure negative grade for downhill
+    grade = -abs(grade)
+    
+    # Generate scenario data
+    df = generate_scenario_data(
+        drive_duration_sec=drive_duration_sec,
+        window_size_sec=window_size_sec,
+        speed_kmph=speed_kmph,
+        initial_soc_percent=initial_soc_percent,
+        grade=grade,
+        vehicle=vehicle,
+        env=env
+    )
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(14, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+    
+    time_min = df['time_stamp_sec'] / 60
+    
+    # Plot 1: SOC and Remaining Energy
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1_twin = ax1.twinx()
+    
+    line1 = ax1.plot(time_min, df['soc_percent'], 'b-', linewidth=2, label='SOC (%)')
+    line2 = ax1_twin.plot(time_min, df['remaining_energy_kwh'], 'g--', linewidth=2, label='Remaining Energy (kWh)')
+    
+    ax1.set_xlabel('Time (minutes)', fontsize=11)
+    ax1.set_ylabel('State of Charge (%)', color='b', fontsize=11)
+    ax1_twin.set_ylabel('Remaining Energy (kWh)', color='g', fontsize=11)
+    ax1.tick_params(axis='y', labelcolor='b')
+    ax1_twin.tick_params(axis='y', labelcolor='g')
+    ax1.set_title('Battery State - Downhill Driving', fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    
+    # Plot 2: Remaining Range
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(time_min, df['remaining_range_km'], 'r-', linewidth=2)
+    ax2.fill_between(time_min, 0, df['remaining_range_km'], alpha=0.3, color='r')
+    ax2.set_xlabel('Time (minutes)', fontsize=11)
+    ax2.set_ylabel('Remaining Range (km)', fontsize=11)
+    ax2.set_title('Remaining Range - Downhill Driving', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Energy Breakdown (showing gravity as negative/recovered)
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    # Cumulative energy values
+    cum_motion = df['motion_energy_drain_kwh'].cumsum()
+    cum_gravity = df['gravity_energy_drain_kwh'].cumsum()  # Will be negative for downhill
+    cum_heat = df['heat_energy_drain_kwh'].cumsum()
+    cum_aux = df['aux_energy_drain_kwh'].cumsum()
+    cum_regen = df['regen_energy_gain_kwh'].cumsum()
+    cum_total = df['battery_energy_spend_kwh'].cumsum()
+    
+    ax3.plot(time_min, cum_motion, '-', linewidth=2, label='Motion (drain)', color='#2ecc71')
+    ax3.plot(time_min, cum_gravity, '-', linewidth=2, label='Gravity (gain)', color='#e74c3c')
+    ax3.plot(time_min, cum_heat, '-', linewidth=2, label='Heat Loss', color='#f39c12')
+    ax3.plot(time_min, cum_aux, '-', linewidth=2, label='Auxiliary', color='#9b59b6')
+    ax3.plot(time_min, cum_regen, '--', linewidth=2, label='Regen (gain)', color='#3498db')
+    ax3.plot(time_min, cum_total, 'k-', linewidth=3, label='Net Energy', alpha=0.7)
+    
+    ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax3.set_xlabel('Time (minutes)', fontsize=11)
+    ax3.set_ylabel('Cumulative Energy (kWh)', fontsize=11)
+    ax3.set_title('Energy Breakdown - Downhill Driving', fontsize=12, fontweight='bold')
+    ax3.legend(loc='best', fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Energy balance per window
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Net energy per window (positive = drain, negative = gain)
+    net_energy = df['battery_energy_spend_kwh'] * 1000  # Convert to Wh
+    
+    colors = ['#2ecc71' if e < 0 else '#e74c3c' for e in net_energy]
+    
+    if len(df) > 30:
+        indices = np.linspace(0, len(df)-1, 30, dtype=int)
+        df_sample = df.iloc[indices]
+        net_sample = net_energy.iloc[indices]
+        colors_sample = [colors[i] for i in indices]
+    else:
+        df_sample = df
+        net_sample = net_energy
+        colors_sample = colors
+    
+    x = np.arange(len(df_sample))
+    ax4.bar(x, net_sample, color=colors_sample, alpha=0.8)
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    
+    ax4.set_xlabel('Time Window', fontsize=11)
+    ax4.set_ylabel('Net Energy per Window (Wh)', fontsize=11)
+    ax4.set_title('Net Energy Balance - Downhill', fontsize=12, fontweight='bold')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add annotation
+    positive_energy = net_sample[net_sample > 0].sum()
+    negative_energy = net_sample[net_sample < 0].sum()
+    ax4.annotate(f'Energy Drain: {positive_energy:.1f} Wh\nEnergy Gain: {abs(negative_energy):.1f} Wh',
+                 xy=(0.02, 0.98), xycoords='axes fraction', fontsize=9,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Add overall title
+    fig.suptitle(f'Downhill Driving Scenario: {speed_kmph:.0f} km/h, {grade:.1f}% grade, {vehicle.mass:.0f} kg vehicle',
+                 fontsize=14, fontweight='bold', y=0.98)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, f'downhill_scenario_{abs(grade):.0f}pct_grade.png')
+        fig.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"  Saved plot: {filepath}")
+    
+    return fig
+
+
+def plot_uphill_downhill_comparison(
+    speed_kmph: float = 60.0,
+    grade: float = 5.0,
+    initial_soc_percent: float = 80.0,
+    drive_duration_sec: int = 1800,
+    window_size_sec: int = 30,
+    vehicle: Optional[VehicleParams] = None,
+    env: Optional[EnvironmentParams] = None,
+    output_dir: str = 'plots',
+    save_plot: bool = True
+) -> plt.Figure:
+    """
+    Generate comparison plots for uphill vs downhill driving scenarios.
+    
+    Args:
+        speed_kmph: Vehicle speed (km/h)
+        grade: Road grade magnitude (%)
+        initial_soc_percent: Initial state of charge (%)
+        drive_duration_sec: Duration of drive (seconds)
+        window_size_sec: Time window size (seconds)
+        vehicle: Vehicle parameters
+        env: Environment parameters
+        output_dir: Directory to save plots
+        save_plot: Whether to save the plot to file
+    
+    Returns:
+        Matplotlib figure object
+    """
+    vehicle = vehicle or VehicleParams()
+    env = env or EnvironmentParams()
+    
+    # Generate both scenarios
+    df_uphill = generate_scenario_data(
+        drive_duration_sec=drive_duration_sec,
+        window_size_sec=window_size_sec,
+        speed_kmph=speed_kmph,
+        initial_soc_percent=initial_soc_percent,
+        grade=abs(grade),
+        vehicle=vehicle,
+        env=env
+    )
+    
+    df_downhill = generate_scenario_data(
+        drive_duration_sec=drive_duration_sec,
+        window_size_sec=window_size_sec,
+        speed_kmph=speed_kmph,
+        initial_soc_percent=initial_soc_percent,
+        grade=-abs(grade),
+        vehicle=vehicle,
+        env=env
+    )
+    
+    # Also generate flat road for reference
+    df_flat = generate_scenario_data(
+        drive_duration_sec=drive_duration_sec,
+        window_size_sec=window_size_sec,
+        speed_kmph=speed_kmph,
+        initial_soc_percent=initial_soc_percent,
+        grade=0,
+        vehicle=vehicle,
+        env=env
+    )
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    time_up = df_uphill['time_stamp_sec'] / 60
+    time_down = df_downhill['time_stamp_sec'] / 60
+    time_flat = df_flat['time_stamp_sec'] / 60
+    
+    # Plot 1: SOC Comparison
+    ax1 = axes[0, 0]
+    ax1.plot(time_up, df_uphill['soc_percent'], 'r-', linewidth=2, label=f'Uphill (+{grade}%)')
+    ax1.plot(time_down, df_downhill['soc_percent'], 'g-', linewidth=2, label=f'Downhill (-{grade}%)')
+    ax1.plot(time_flat, df_flat['soc_percent'], 'b--', linewidth=2, label='Flat Road')
+    ax1.set_xlabel('Time (minutes)', fontsize=11)
+    ax1.set_ylabel('State of Charge (%)', fontsize=11)
+    ax1.set_title('SOC Comparison: Uphill vs Downhill', fontsize=12, fontweight='bold')
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Remaining Range Comparison
+    ax2 = axes[0, 1]
+    ax2.plot(time_up, df_uphill['remaining_range_km'], 'r-', linewidth=2, label=f'Uphill (+{grade}%)')
+    ax2.plot(time_down, df_downhill['remaining_range_km'], 'g-', linewidth=2, label=f'Downhill (-{grade}%)')
+    ax2.plot(time_flat, df_flat['remaining_range_km'], 'b--', linewidth=2, label='Flat Road')
+    ax2.set_xlabel('Time (minutes)', fontsize=11)
+    ax2.set_ylabel('Remaining Range (km)', fontsize=11)
+    ax2.set_title('Remaining Range Comparison', fontsize=12, fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Cumulative Energy Consumption
+    ax3 = axes[1, 0]
+    cum_up = df_uphill['battery_energy_spend_kwh'].cumsum()
+    cum_down = df_downhill['battery_energy_spend_kwh'].cumsum()
+    cum_flat = df_flat['battery_energy_spend_kwh'].cumsum()
+    
+    ax3.plot(time_up, cum_up, 'r-', linewidth=2, label=f'Uphill (+{grade}%)')
+    ax3.plot(time_down, cum_down, 'g-', linewidth=2, label=f'Downhill (-{grade}%)')
+    ax3.plot(time_flat, cum_flat, 'b--', linewidth=2, label='Flat Road')
+    ax3.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax3.set_xlabel('Time (minutes)', fontsize=11)
+    ax3.set_ylabel('Cumulative Energy Consumption (kWh)', fontsize=11)
+    ax3.set_title('Energy Consumption Comparison', fontsize=12, fontweight='bold')
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Energy Rate (kWh/km)
+    ax4 = axes[1, 1]
+    
+    # Calculate energy consumption rate per km
+    rate_up = df_uphill['battery_energy_spend_kwh'] / df_uphill['distance_km']
+    rate_down = df_downhill['battery_energy_spend_kwh'] / df_downhill['distance_km']
+    rate_flat = df_flat['battery_energy_spend_kwh'] / df_flat['distance_km']
+    
+    # Use rolling average for smoother visualization
+    window = 5
+    rate_up_smooth = rate_up.rolling(window=window, min_periods=1).mean()
+    rate_down_smooth = rate_down.rolling(window=window, min_periods=1).mean()
+    rate_flat_smooth = rate_flat.rolling(window=window, min_periods=1).mean()
+    
+    ax4.plot(time_up, rate_up_smooth * 1000, 'r-', linewidth=2, label=f'Uphill (+{grade}%)')
+    ax4.plot(time_down, rate_down_smooth * 1000, 'g-', linewidth=2, label=f'Downhill (-{grade}%)')
+    ax4.plot(time_flat, rate_flat_smooth * 1000, 'b--', linewidth=2, label='Flat Road')
+    ax4.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax4.set_xlabel('Time (minutes)', fontsize=11)
+    ax4.set_ylabel('Energy Consumption Rate (Wh/km)', fontsize=11)
+    ax4.set_title('Energy Efficiency Comparison', fontsize=12, fontweight='bold')
+    ax4.legend(loc='best')
+    ax4.grid(True, alpha=0.3)
+    
+    # Add overall title
+    fig.suptitle(f'Uphill vs Downhill Comparison: {speed_kmph:.0f} km/h, ±{grade}% grade, {vehicle.mass:.0f} kg vehicle',
+                 fontsize=14, fontweight='bold', y=0.98)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_plot:
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, f'uphill_downhill_comparison_{grade:.0f}pct.png')
+        fig.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"  Saved plot: {filepath}")
+    
+    return fig
+
+
+# =============================================================================
 # Training Data Generation
 # =============================================================================
 
@@ -985,14 +1448,21 @@ def generate_varying_speed_scenario(
         
         # Update SOC
         current_soc_percent -= (step_energy_spend / vehicle.battery_capacity) * 100
+        # Cap SOC at 100%
+        current_soc_percent = min(100.0, current_soc_percent)
         
         # Calculate remaining energy and range
         remaining_energy = max(0, (current_soc_percent / 100) * vehicle.battery_capacity)
         distance_km = speeds[i] * (window_size_sec / 3600.0)
         
-        if current_soc_percent > 0 and step_energy_spend > 0:
+        # Calculate remaining range based on energy consumption
+        if step_energy_spend > 0.0001:  # Positive energy consumption
             energy_per_km = step_energy_spend / distance_km
             remaining_range = remaining_energy / energy_per_km
+            remaining_range = min(remaining_range, 2000.0)  # Cap at 2000 km
+        elif step_energy_spend <= 0:  # Energy gain (downhill)
+            remaining_range = remaining_energy / 0.15  # Conservative estimate
+            remaining_range = min(remaining_range, 2000.0)
         else:
             remaining_range = 0
         
@@ -1191,12 +1661,57 @@ def main():
         drive_duration_sec, window_size_sec, speed_kmph, initial_soc_percent,
         vehicle=vehicle, env=env
     )
-    print(f"  Duration: {drive_duration_sec/60:.0f} minutes")
-    print(f"  Final SOC: {df_sample['soc_percent'].iloc[-1]:.1f}%")
-    print(f"  Final remaining energy: {df_sample['remaining_energy_kwh'].iloc[-1]:.1f} kWh")
-    print(f"  Final remaining range: {df_sample['remaining_range_km'].iloc[-1]:.1f} km")
-    print(f"  Distance traveled: {df_sample['distance_km'].sum():.1f} km")
+    #print(f"  Duration: {drive_duration_sec/60:.0f} minutes")
+    #print(f"  Final SOC: {df_sample['soc_percent'].iloc[-1]:.1f}%")
+    #print(f"  Final remaining energy: {df_sample['remaining_energy_kwh'].iloc[-1]:.1f} kWh")
+    #print(f"  Final remaining range: {df_sample['remaining_range_km'].iloc[-1]:.1f} km")
+    #print(f"  Distance traveled: {df_sample['distance_km'].sum():.1f} km")
     save_scenario_to_csv(df_sample, "sample_scenario")
+    
+
+
+    exit()
+    
+    # Generate uphill/downhill scenario plots
+    print("\n" + "=" * 70)
+    print("Generating Uphill/Downhill Scenario Plots...")
+    print("=" * 70)
+    
+    print("\n[Uphill Scenario] 60 km/h, 5% grade")
+    plot_uphill_scenario(
+        speed_kmph=60.0,
+        grade=5.0,
+        initial_soc_percent=90.0,
+        drive_duration_sec=3600,
+        window_size_sec=30,
+        vehicle=vehicle,
+        env=env,
+        output_dir='plots'
+    )
+    
+    print("\n[Downhill Scenario] 60 km/h, -5% grade")
+    plot_downhill_scenario(
+        speed_kmph=60.0,
+        grade=-5.0,
+        initial_soc_percent=70.0,
+        drive_duration_sec=3600,
+        window_size_sec=30,
+        vehicle=vehicle,
+        env=env,
+        output_dir='plots'
+    )
+    
+    print("\n[Comparison] Uphill vs Downhill vs Flat")
+    plot_uphill_downhill_comparison(
+        speed_kmph=60.0,
+        grade=5.0,
+        initial_soc_percent=80.0,
+        drive_duration_sec=1800,
+        window_size_sec=30,
+        vehicle=vehicle,
+        env=env,
+        output_dir='plots'
+    )
     
     # Generate training dataset
     print("\n" + "=" * 70)
@@ -1218,6 +1733,9 @@ def main():
     print("  - scenario_data/sample_scenario.csv (single scenario demo)")
     print("  - training_data/ev_mixed_training_data.csv (full training data)")
     print("  - training_data/ev_ml_dataset.csv (ML-ready features + targets)")
+    print("  - plots/uphill_scenario_5pct_grade.png")
+    print("  - plots/downhill_scenario_5pct_grade.png")
+    print("  - plots/uphill_downhill_comparison_5pct.png")
     print("\nML Dataset columns:")
     print("  Features: avg_speed_kmh, grade, vehicle_mass, battery_capacity_kwh,")
     print("            soc_percent, distance_km")
